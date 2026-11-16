@@ -1,0 +1,16 @@
+{
+    "schemaVersion":  1,
+    "name":  "Susuy0725 WMCX Extensions",
+    "identifier":  "com.susuy0725.wmcx-exd-sus",
+    "description":  "Web mai Chart X 擴充程式儲存庫（WERP Schema v1）",
+    "extensions":  [
+                       {
+                           "id":  "com.susuy0725.hand-hint-engine",
+                           "name":  "手順解析引擎",
+                           "version":  "1.0.0",
+                           "description":  "自動推算 maimai 譜面左右手順（L / R / BOTH），提供虛擬雙手游標與移動軌跡、主圓盤手順角標及視覺化編輯器手順提示。",
+                           "file":  "Extensions/com.susuy0725.hand-hint-engine-1.0.0.zip",
+                           "sha256":  "a0ad87f4e6f35300d76d3ba602f5081949afd28b984cd40aee5d263bc02f66fb"
+                       }
+                   ]
+}
