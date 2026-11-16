@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
     EXTENSION_ID,
     scaleBase,
+    innerCirleBase,
     noteRefPos,
     getNoteScreenPos,
     resolveWifiWingPaths,
@@ -607,5 +608,184 @@ test('Hold 鎖手期間即使音符位於同側且需遠手跨區，仍絕不指
         );
     }
 });
+
+test('單向圓周刷鍵結尾接 Hold (2..1,2h,5h) 應以同一手接住結尾 Hold 並以另一手接後續 Hold', () => {
+    // 模擬 {32}2,3,4,5,6,7,8,1 x3, {8}2h[16:34], {1}5h[16:58] (BPM 150 -> {32}=0.05s, {8}=0.2s)
+    const notes = [];
+    let t = 1.0;
+    for (let round = 0; round < 3; round++) {
+        for (const pos of [2, 3, 4, 5, 6, 7, 8, 1]) {
+            notes.push({ type: 'tap', pos, time: t });
+            t += 0.05;
+        }
+    }
+    const hold2 = { type: 'hold', pos: 2, time: t, holdDuration: 0.85 };
+    notes.push(hold2);
+    const hold5 = { type: 'hold', pos: 5, time: t + 0.2, holdDuration: 1.45 };
+    notes.push(hold5);
+
+    const { assignments } = computeHandAssignments(notes);
+    const sweepHand = assignments.get(notes[0]).hand;
+    for (let i = 0; i < 24; i++) {
+        assert.equal(assignments.get(notes[i]).hand, sweepHand, `刷鍵第 ${i} 顆應維持 ${sweepHand}`);
+    }
+    assert.equal(assignments.get(hold2).hand, sweepHand, '結尾 2h 應維持刷鍵同一隻手');
+    assert.notEqual(assignments.get(hold5).hand, sweepHand, '後續 5h 應換成另一隻手');
+});
+
+test('連續同向 Touch 滑掃 (A6 -> B6 -> C -> B2 -> A2) 應以單手順掃，不應交錯換手', () => {
+    const notes = [
+        { type: 'touch', touchPos: 'A', pos: 6, time: 1.00 },
+        { type: 'touch', touchPos: 'B', pos: 6, time: 1.06 },
+        { type: 'touch', touchPos: 'C', pos: 1, time: 1.12 },
+        { type: 'touch', touchPos: 'B', pos: 2, time: 1.18 },
+        { type: 'touch', touchPos: 'A', pos: 2, time: 1.24 },
+    ];
+    const { assignments } = computeHandAssignments(notes);
+    const firstHand = assignments.get(notes[0]).hand;
+    assert.equal(firstHand, 'L');
+    for (let i = 1; i < notes.length; i++) {
+        assert.equal(assignments.get(notes[i]).hand, firstHand, `Touch 滑掃第 ${i} 顆應維持同一隻手 ${firstHand}`);
+    }
+});
+
+test('Hold 剛結束緊接另一側 Hold 時不應同手瞬移（應換另一隻空閒手接取）', () => {
+    const hold3 = { type: 'hold', pos: 3, time: 1.0, holdDuration: 0.5 };
+    const hold1 = { type: 'hold', pos: 1, time: 1.53, holdDuration: 0.5 };
+    const { assignments } = computeHandAssignments([hold3, hold1]);
+    assert.equal(assignments.get(hold3).hand, 'R');
+    assert.equal(assignments.get(hold1).hand, 'L', '放開 3h 後 0.03s 接 1h 應由空閒的 L 接取');
+});
+
+test('Slide 接力 (首尾相接的不同 Slide) 應盡量維持同一隻手不換手', () => {
+    const star1 = { type: 'tap', isStar: true, pos: 6, time: 1.0 };
+    const slide1 = {
+        type: 'slide',
+        index: 1,
+        pos: 6,
+        slideEnd: 4,
+        slideType: '-',
+        firstSlide: true,
+        lastSlide: true,
+        time: 1.0,
+        slideDelay: 0.1,
+        slideDuration: 0.4,
+        path: makeLinearPath(6, 4),
+    };
+    const tap8 = { type: 'tap', pos: 8, time: 1.25 };
+    const star2 = { type: 'tap', isStar: true, pos: 4, time: 1.42 };
+    const slide2 = {
+        type: 'slide',
+        index: 2,
+        pos: 4,
+        slideEnd: 2,
+        slideType: '-',
+        firstSlide: true,
+        lastSlide: true,
+        time: 1.42,
+        slideDelay: 0.08,
+        slideDuration: 0.4,
+        path: makeLinearPath(4, 2),
+    };
+
+    const { assignments } = computeHandAssignments([star1, slide1, tap8, star2, slide2]);
+    const h1 = assignments.get(slide1).hand;
+    const h2 = assignments.get(slide2).hand;
+    assert.equal(h2, h1, '首尾相接的 Slide 接力應維持同一隻手不換手');
+});
+
+test('同頭分岔雙 Slide (1>5*q6) 應使用雙手分擔，同頭同向重疊延展 Slide (3>1*>8*>7*>6) 應維持單手且保留空閒手', () => {
+    const r = innerCirleBase;
+    const cwArc = (start, steps) => {
+        const a0 = ((start - 1.5) * Math.PI) / 4;
+        const span = (steps * Math.PI) / 4;
+        return {
+            totalLength: r * span,
+            getPointAt: (t) => {
+                const a = a0 + span * t;
+                return { x: Math.cos(a) * r, y: Math.sin(a) * r };
+            },
+        };
+    };
+    const ccwArc = (start, steps) => {
+        const a0 = ((start - 1.5) * Math.PI) / 4;
+        const span = (steps * Math.PI) / 4;
+        return {
+            totalLength: r * span,
+            getPointAt: (t) => {
+                const a = a0 - span * t;
+                return { x: Math.cos(a) * r, y: Math.sin(a) * r };
+            },
+        };
+    };
+    const qPath = (start, end) => {
+        const p0 = getNoteScreenPos(start);
+        const p1 = getNoteScreenPos(end);
+        return {
+            totalLength: r * 2.2,
+            getPointAt: (t) =>
+                t < 0.5
+                    ? { x: p0.x * (1 - 2 * t), y: p0.y * (1 - 2 * t) }
+                    : { x: p1.x * (2 * t - 1), y: p1.y * (2 * t - 1) },
+        };
+    };
+
+    // 1. 1>5[16:3]*q6[16:3] -> 雙手（1>5 走右側 R，1q6 走左側 L）
+    const s15 = {
+        type: 'slide',
+        index: 1,
+        pos: 1,
+        slideEnd: 5,
+        slideType: '>',
+        firstSlide: true,
+        lastSlide: true,
+        time: 1.0,
+        slideDelay: 0.2,
+        slideDuration: 0.3,
+        path: cwArc(1, 4),
+    };
+    const s1q6 = {
+        type: 'slide',
+        index: 1,
+        pos: 1,
+        slideEnd: 6,
+        slideType: 'q',
+        firstSlide: true,
+        lastSlide: true,
+        time: 1.0,
+        slideDelay: 0.2,
+        slideDuration: 0.3,
+        path: qPath(1, 6),
+    };
+    const resDiv = computeHandAssignments([
+        { type: 'tap', isStar: true, isMultiple: true, pos: 1, time: 1.0 },
+        s15,
+        s1q6,
+    ]);
+    assert.equal(resDiv.assignments.get(s15).hand, 'R');
+    assert.equal(resDiv.assignments.get(s1q6).hand, 'L');
+
+    // 2. 3>1[8:2]*>8[8:3]*>7[8:4]*>6[8:5] -> 單手掃完 4 條延展軌跡，另一隻手可自由接中間的 Tap
+    const extSlides = [
+        { type: 'slide', index: 2, pos: 3, slideEnd: 1, slideType: '>', firstSlide: true, lastSlide: true, time: 1.0, slideDelay: 0.2, slideDuration: 0.4, path: ccwArc(3, 2) },
+        { type: 'slide', index: 2, pos: 3, slideEnd: 8, slideType: '>', firstSlide: true, lastSlide: true, time: 1.0, slideDelay: 0.2, slideDuration: 0.6, path: ccwArc(3, 3) },
+        { type: 'slide', index: 2, pos: 3, slideEnd: 7, slideType: '>', firstSlide: true, lastSlide: true, time: 1.0, slideDelay: 0.2, slideDuration: 0.8, path: ccwArc(3, 4) },
+        { type: 'slide', index: 2, pos: 3, slideEnd: 6, slideType: '>', firstSlide: true, lastSlide: true, time: 1.0, slideDelay: 0.2, slideDuration: 1.0, path: ccwArc(3, 5) },
+    ];
+    const midTap = { type: 'tap', pos: 4, time: 1.5 };
+    const resOverlap = computeHandAssignments([
+        { type: 'tap', isStar: true, isMultiple: true, pos: 3, time: 1.0 },
+        ...extSlides,
+        midTap,
+    ]);
+    const sweepHand = resOverlap.assignments.get(extSlides[0]).hand;
+    for (let i = 1; i < extSlides.length; i++) {
+        assert.equal(resOverlap.assignments.get(extSlides[i]).hand, sweepHand, `重疊延展分支 ${i} 應維持同一隻手`);
+    }
+    assert.notEqual(resOverlap.assignments.get(midTap).hand, sweepHand, '另一隻空閒手應能接取滑動期間的 Tap');
+});
+
+
+
 
 

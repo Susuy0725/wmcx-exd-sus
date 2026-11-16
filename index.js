@@ -277,40 +277,41 @@ function resolveManualHand(note, manualOverrides) {
     return null;
 }
 
-function getSingleOuterButtonPos(step, manualOverrides) {
+function getSingleOuterButtonInfo(step) {
     if (!step || step.slideItems.length > 0) return null;
     const activeHeads = step.headItems.filter((it) => !it.note.isMine || it.manualHand);
     if (activeHeads.length !== 1) return null;
     const n = activeHeads[0].note;
-    if (!n || n.touchPos || n.type === 'hold' || n.holdDuration) return null;
-    if (manualOverrides && resolveManualHand(n, manualOverrides)) {
-        // 仍允許刷鍵偵測，唯後續 DP 會優先尊重手動指定
-    }
+    if (!n || n.touchPos) return null;
     const pos = parseInt(n.pos, 10);
-    return pos >= 1 && pos <= 8 ? pos : null;
+    if (!(pos >= 1 && pos <= 8)) return null;
+    return {
+        pos,
+        isHold: n.type === 'hold' || Boolean(n.holdDuration),
+    };
 }
 
 /**
- * 預先標記單向圓周刷鍵區段（如 1,2,3,4,5,6,7,8 或 8,7,6,5,4,3,2,1）
- * 排除來回折返的交互（如 1,2,1,2 或 1,2,1,8）
+ * 預先標記單向圓周刷鍵區段（如 1,2,3,4,5,6,7,8 或 2,3,4,5,6,7,8,1,2h）
+ * 允許以 Hold 作為刷鍵終點，並排除來回折返的交互（如 1,2,1,2 或 1,2,1,8）
  */
-function markCircularSweepSteps(timelineSteps, manualOverrides) {
+function markCircularSweepSteps(timelineSteps) {
     const len = timelineSteps.length;
     if (len < 3) return;
 
-    const singlePositions = new Array(len);
+    const singleInfos = new Array(len);
     for (let i = 0; i < len; i++) {
-        singlePositions[i] = getSingleOuterButtonPos(timelineSteps[i], manualOverrides);
+        singleInfos[i] = getSingleOuterButtonInfo(timelineSteps[i]);
     }
 
     const transDirs = new Int8Array(len); // 1: 順時針(+1), -1: 逆時針(-1), 0: 非單向相鄰
     for (let i = 1; i < len; i++) {
-        const pPrev = singlePositions[i - 1];
-        const pCur = singlePositions[i];
-        if (pPrev === null || pCur === null) continue;
+        const infoPrev = singleInfos[i - 1];
+        const infoCur = singleInfos[i];
+        if (!infoPrev || infoPrev.isHold || !infoCur) continue;
         const dt = timelineSteps[i].time - timelineSteps[i - 1].time;
         if (dt < 0.015 || dt > 0.22) continue;
-        const diff = (pCur - pPrev + 8) % 8;
+        const diff = (infoCur.pos - infoPrev.pos + 8) % 8;
         if (diff === 1) {
             transDirs[i] = 1;
         } else if (diff === 7) {
@@ -356,6 +357,78 @@ function markCircularSweepSteps(timelineSteps, manualOverrides) {
     }
 }
 
+function getSingleTouchInfo(step) {
+    if (!step || step.slideItems.length > 0 || step.isSweepContinuation || step.sweepStartDir) {
+        return null;
+    }
+    const activeHeads = step.headItems.filter((it) => !it.note.isMine || it.manualHand);
+    if (activeHeads.length !== 1) return null;
+    const item = activeHeads[0];
+    const n = item.note;
+    if (!n || !n.touchPos) return null;
+    return {
+        x: item.nx,
+        y: item.ny,
+        isHold: n.type === 'hold' || Boolean(n.holdDuration),
+    };
+}
+
+/**
+ * 預先標記連續同向 Touch 滑掃區段（如 A6 -> B6 -> C -> B2 -> A2）
+ * 排除折返來回點擊，維持單手順掃
+ */
+function markTouchSweepSteps(timelineSteps) {
+    const len = timelineSteps.length;
+    if (len < 3) return;
+
+    const touchInfos = new Array(len);
+    for (let i = 0; i < len; i++) {
+        touchInfos[i] = getSingleTouchInfo(timelineSteps[i]);
+    }
+
+    const transitions = new Array(len).fill(null);
+    const minDist = 0.15 * innerCirleBase;
+    const maxDist = 0.85 * innerCirleBase;
+
+    for (let i = 1; i < len; i++) {
+        const prev = touchInfos[i - 1];
+        const cur = touchInfos[i];
+        if (!prev || prev.isHold || !cur) continue;
+        const dt = timelineSteps[i].time - timelineSteps[i - 1].time;
+        if (dt < 0.015 || dt > 0.22) continue;
+        const dx = cur.x - prev.x;
+        const dy = cur.y - prev.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist >= minDist && dist <= maxDist) {
+            transitions[i] = { dx, dy, dist };
+        }
+    }
+
+    let i = 1;
+    while (i < len) {
+        if (!transitions[i]) {
+            i++;
+            continue;
+        }
+        const segStart = i;
+        while (i + 1 < len && transitions[i + 1]) {
+            const v1 = transitions[i];
+            const v2 = transitions[i + 1];
+            const cosTheta = (v1.dx * v2.dx + v1.dy * v2.dy) / (v1.dist * v2.dist);
+            if (cosTheta < 0.4) break;
+            i++;
+        }
+        const segEnd = i;
+        const runLen = segEnd - segStart + 1;
+        if (runLen >= 2) {
+            for (let k = segStart; k <= segEnd; k++) {
+                timelineSteps[k].isSweepContinuation = true;
+            }
+        }
+        i = segEnd + 1;
+    }
+}
+
 /**
  * 計算手部在指定時間點的有效位置（閒置超過 0.8s 且未鎖定時平滑回歸休息區）
  */
@@ -381,6 +454,7 @@ function scoreAndApplyAction(dpState, hand, nx, ny, actionTime, opts) {
         lockUntil,
         endX = nx,
         endY = ny,
+        midX = (nx + endX) / 2,
         isSingleHead = false,
         posKey = null,
         allowLock = true,
@@ -390,6 +464,9 @@ function scoreAndApplyAction(dpState, hand, nx, ny, actionTime, opts) {
         starHeadHand = null,
         isSweepContinuation = false,
         sweepStartDir = 0,
+        relayHand = null,
+        relayChainEndTime = -10,
+        skipSameStepOtherCross = false,
     } = opts;
 
     const st = hand === 'L' ? dpState.stateL : dpState.stateR;
@@ -397,12 +474,15 @@ function scoreAndApplyAction(dpState, hand, nx, ny, actionTime, opts) {
     const otherSt = hand === 'L' ? dpState.stateR : dpState.stateL;
     let deltaCost = 0;
 
-    // 1. Hold / Slide 佔用鎖定懲罰（硬性優先避讓被鎖定的手，除非雙手皆已鎖定）
-    if (allowLock && st.lockUntil > actionTime + 0.015) {
+    // 1. Hold / Slide 佔用鎖定懲罰（硬性優先避讓被鎖定的手，除非雙手皆已鎖定或屬於 Slide 接力延續）
+    const lockCheckLimit = isSlide && relayHand === hand
+        ? Math.max(actionTime + 0.015, relayChainEndTime + 0.015)
+        : actionTime + 0.015;
+    if (allowLock && st.lockUntil > lockCheckLimit) {
         deltaCost += 10000;
     }
 
-    // 2. 同一時間步的頭音符 / 星星頭與滑軌一致性檢查
+    // 2. 同一時間步的頭音符 / 星星頭與滑軌一致性檢查 / Slide 接力延續偏好
     if (isSlide) {
         if (handAtStartPos === hand) {
             deltaCost -= 25;
@@ -414,6 +494,13 @@ function scoreAndApplyAction(dpState, hand, nx, ny, actionTime, opts) {
                 deltaCost -= 60;
             } else if (starHeadHand !== hand) {
                 deltaCost += 40;
+            }
+        }
+        if (relayHand) {
+            if (relayHand === hand && !(usedHandsOtherPos && usedHandsOtherPos.has(hand))) {
+                deltaCost -= 160;
+            } else if (relayHand !== hand) {
+                deltaCost += 120;
             }
         }
     }
@@ -443,7 +530,7 @@ function scoreAndApplyAction(dpState, hand, nx, ny, actionTime, opts) {
         }
 
         if (dpState.lastHand === hand && dpState.lastActionTime > -9) {
-            const dtPrev = Math.max(0.025, actionTime - dpState.lastActionTime);
+            const dtPrev = Math.min(Math.max(0.025, actionTime - dpState.lastActionTime), dt);
             if (dtPrev < 0.28) {
                 // 僅在真正高速區間施加同手跳鍵懲罰，避免中慢速 (0.3s+) 硬逼遠手跨區接鍵
                 const urgency = (0.28 - dtPrev) / 0.20;
@@ -462,12 +549,22 @@ function scoreAndApplyAction(dpState, hand, nx, ny, actionTime, opts) {
             }
         } else if (dpState.lastHand && dpState.lastHand !== hand) {
             deltaCost += 14 * (dNorm / Math.min(0.8, dt));
+            if (st.time > -9 && dt < 0.22 && dNorm > 0.25) {
+                // 剛放開 Hold/Slide 立即同手遠距跳鍵懲罰（即使中間穿插了另一隻手的音符）
+                const urgency = (0.22 - dt) / 0.18;
+                const dtEff = Math.max(0.02, dt - 0.03);
+                deltaCost += urgency * (110 + 50 * (dNorm / dtEff));
+            }
+        } else if (st.time > -9 && dt < 0.22 && dNorm > 0.25) {
+            const urgency = (0.22 - dt) / 0.18;
+            const dtEff = Math.max(0.02, dt - 0.03);
+            deltaCost += urgency * (110 + 50 * (dNorm / dtEff));
         }
     }
 
-    // 5. 半場自然偏好 & 6. 強力雙手交叉（反手）避讓（單向刷鍵延續時豁免）
-    if (!(isSweepContinuation && dpState.lastHand === hand)) {
-        const refX = isSlide ? 0.4 * nx + 0.6 * endX : nx;
+    // 5. 半場自然偏好 & 6. 強力雙手交叉（反手）避讓（單向刷鍵延續或 Slide 接力延續時豁免）
+    if (!(isSweepContinuation && dpState.lastHand === hand) && !(isSlide && relayHand === hand)) {
+        const refX = isSlide ? 0.25 * nx + 0.45 * midX + 0.30 * endX : nx;
         const deadZone = 0.05 * innerCirleBase;
         const halfWeight = isSlide ? 24 : 20;
         if (hand === 'L' && refX > deadZone) {
@@ -478,7 +575,7 @@ function scoreAndApplyAction(dpState, hand, nx, ny, actionTime, opts) {
 
         const otherIdle = actionTime - otherSt.time;
         const otherLocked = otherSt.lockUntil > actionTime + 0.015;
-        if (otherLocked || otherIdle < 1.1) {
+        if (!skipSameStepOtherCross && (otherLocked || otherIdle < 1.1)) {
             const otherEff = getEffectiveHandPos(otherSt, otherHand, actionTime);
             const crossAmount = (x) => {
                 if (hand === 'L' && x > otherEff.x + 2) return (x - otherEff.x) / innerCirleBase;
@@ -513,6 +610,152 @@ function scoreAndApplyAction(dpState, hand, nx, ny, actionTime, opts) {
         lastPosKey: isSingleHead || isSweepContinuation ? posKey : dpState.lastPosKey,
         cost: dpState.cost + deltaCost,
     };
+}
+
+function getSlideMetricLength(slideNote) {
+    if (!slideNote) return 0;
+    if (slideNote.path && typeof slideNote.path.totalLength === 'number' && slideNote.path.totalLength > 0) {
+        return slideNote.path.totalLength;
+    }
+    if (slideNote.path && typeof slideNote.path.getPointAt === 'function') {
+        let len = 0;
+        let prev = slideNote.path.getPointAt(0);
+        for (let k = 1; k <= 8; k++) {
+            const cur = slideNote.path.getPointAt(k / 8);
+            if (prev && cur) {
+                len += Math.hypot(cur.x - prev.x, cur.y - prev.y);
+            }
+            prev = cur;
+        }
+        if (len > 0) return len;
+    }
+    return slideNote.slideDuration || 0;
+}
+
+/**
+ * 判斷短分支 slideA 的軌跡是否完全重疊於長分支 slideB 的前段路徑上
+ * 用於區分「同路徑延展多星」(如 3>1*>8*>7*>6 -> 單手) 與「分岔雙手多頭」(如 1>5*q6 -> 雙手)
+ */
+function isSlidePathOverlapPrefix(shortSlide, longSlide) {
+    if (!shortSlide || !longSlide) return false;
+    if (shortSlide.slideType === 'w' || longSlide.slideType === 'w') return false;
+
+    const pShort = shortSlide.path;
+    const pLong = longSlide.path;
+    if (pShort && typeof pShort.getPointAt === 'function' && pLong && typeof pLong.getPointAt === 'function') {
+        const SAMPLES = 32;
+        const longPts = new Array(SAMPLES + 1);
+        for (let k = 0; k <= SAMPLES; k++) {
+            longPts[k] = pLong.getPointAt(k / SAMPLES);
+        }
+        const s0 = pShort.getPointAt(0);
+        const l0 = longPts[0];
+        if (!s0 || !l0 || Math.hypot(s0.x - l0.x, s0.y - l0.y) > 0.18 * innerCirleBase) {
+            return false;
+        }
+
+        const uList = [0.2, 0.4, 0.6, 0.8, 1.0];
+        let prevK = 0;
+        let firstBestK = -1;
+        const tol = 0.18 * innerCirleBase;
+
+        for (let idx = 0; idx < uList.length; idx++) {
+            const pt = pShort.getPointAt(uList[idx]);
+            if (!pt) return false;
+            let bestK = -1;
+            let bestDist = Infinity;
+            for (let k = prevK; k <= SAMPLES; k++) {
+                const lpt = longPts[k];
+                if (!lpt) continue;
+                const d = Math.hypot(pt.x - lpt.x, pt.y - lpt.y);
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestK = k;
+                }
+            }
+            if (bestK < 0 || bestDist > tol) {
+                return false;
+            }
+            if (idx === 0) firstBestK = bestK;
+            prevK = bestK;
+        }
+
+        if (prevK < 4) return false;
+        const sEarly = pShort.getPointAt(0.2);
+        const lEarly = longPts[Math.max(1, firstBestK)];
+        if (sEarly && lEarly) {
+            const dot = (sEarly.x - s0.x) * (lEarly.x - l0.x) + (sEarly.y - s0.y) * (lEarly.y - l0.y);
+            if (dot <= 0) return false;
+        }
+        return true;
+    }
+
+    if (shortSlide.pos === longSlide.pos && shortSlide.slideType === longSlide.slideType) {
+        if (shortSlide.slideType === '>' || shortSlide.slideType === '<') return true;
+        if (shortSlide.slideEnd === longSlide.slideEnd) return true;
+    }
+    return false;
+}
+
+/**
+ * 將同時間步的 slideItems 分群：同頭重疊延展的分支併為單手群組，其餘保持獨立分支（雙手分擔）
+ */
+function clusterStepSlides(slideItems) {
+    if (!slideItems || slideItems.length === 0) return [];
+    const specialClusters = [];
+    const normalByHead = new Map();
+
+    for (const sItem of slideItems) {
+        const s = sItem.note;
+        if ((s.isMine && !sItem.manualHand) || (s.slideType === 'w' && !sItem.manualHand)) {
+            specialClusters.push({ kind: 'single', items: [sItem], repItem: sItem });
+            continue;
+        }
+        const headKey = s.firstSlide
+            ? `${s.index ?? 'no_idx'}_${s.pos}_${Math.round((s.time || 0) * 1000)}`
+            : `chain_${s.index ?? 'no_idx'}_${s.pos}_${Math.round((s.time || 0) * 1000)}_${s.slideEnd}`;
+        if (!normalByHead.has(headKey)) {
+            normalByHead.set(headKey, []);
+        }
+        normalByHead.get(headKey).push(sItem);
+    }
+
+    const clusters = [...specialClusters];
+    for (const group of normalByHead.values()) {
+        if (group.length === 1) {
+            clusters.push({ kind: 'cluster', items: group, repItem: group[0] });
+            continue;
+        }
+        const sorted = [...group].sort((a, b) => getSlideMetricLength(b.note) - getSlideMetricLength(a.note));
+        const subClusters = [];
+        for (const item of sorted) {
+            let joined = false;
+            for (const cl of subClusters) {
+                const rep = cl.repItem;
+                const manualCompatible =
+                    !item.manualHand || !rep.manualHand || item.manualHand === rep.manualHand;
+                if (manualCompatible && isSlidePathOverlapPrefix(item.note, rep.note)) {
+                    cl.items.push(item);
+                    if (!rep.manualHand && item.manualHand) {
+                        cl.manualHand = item.manualHand;
+                    }
+                    joined = true;
+                    break;
+                }
+            }
+            if (!joined) {
+                subClusters.push({
+                    kind: 'cluster',
+                    items: [item],
+                    repItem: item,
+                    manualHand: item.manualHand || null,
+                });
+            }
+        }
+        clusters.push(...subClusters);
+    }
+
+    return clusters;
 }
 
 /**
@@ -596,8 +839,9 @@ export function computeHandAssignments(notes, options = {}) {
         idx = endIdx;
     }
 
-    // 2.5 預先標記單向圓周刷鍵區段
-    markCircularSweepSteps(timelineSteps, manualOverrides);
+    // 2.5 預先標記單向圓周刷鍵與連續同向 Touch 滑掃區段
+    markCircularSweepSteps(timelineSteps);
+    markTouchSweepSteps(timelineSteps);
     for (let i = 0; i < timelineSteps.length; i++) {
         if (timelineSteps[i].isSweepContinuation) {
             stats.sweeps += 1;
@@ -759,14 +1003,20 @@ export function computeHandAssignments(notes, options = {}) {
                     slideEndHands: [],
                 }];
 
-                for (const sItem of step.slideItems) {
+                const slideClusters = clusterStepSlides(step.slideItems);
+                for (const cl of slideClusters) {
+                    const sItem = cl.repItem;
                     const s = sItem.note;
-                    const sManualHand = sItem.manualHand;
+                    const sManualHand = cl.manualHand || sItem.manualHand;
                     const nextPool = [];
                     const startPt =
                         s.path && typeof s.path.getPointAt === 'function'
                             ? s.path.getPointAt(0)
                             : getNoteScreenPos(s.pos);
+                    const midPt =
+                        s.path && typeof s.path.getPointAt === 'function'
+                            ? s.path.getPointAt(0.5)
+                            : null;
                     const endPt =
                         s.path && typeof s.path.getPointAt === 'function'
                             ? s.path.getPointAt(1)
@@ -775,7 +1025,13 @@ export function computeHandAssignments(notes, options = {}) {
                     const sy = startPt ? startPt.y : 0;
                     const ex = endPt ? endPt.x : sx;
                     const ey = endPt ? endPt.y : sy;
-                    const slideEnd = s.time + (s.slideDelay || 0) + (s.slideDuration || 0);
+                    const midX = midPt ? midPt.x : (sx + ex) / 2;
+                    let clusterEnd = 0;
+                    for (const br of cl.items) {
+                        const brEnd = br.note.time + (br.note.slideDelay || 0) + (br.note.slideDuration || 0);
+                        if (brEnd > clusterEnd) clusterEnd = brEnd;
+                    }
+                    const slideEnd = clusterEnd;
 
                     if (s.isMine && !sManualHand) {
                         for (const p of branchPool) {
@@ -864,6 +1120,16 @@ export function computeHandAssignments(notes, options = {}) {
                                 )
                             )
                             : null;
+                        const relayChain = !existingChain
+                            ? p.chains.find(
+                                (c) =>
+                                    c.endTime >= stepTime - 0.15 &&
+                                    c.endTime <= stepTime + 0.06 &&
+                                    ((typeof c.endX === 'number' &&
+                                        Math.hypot(c.endX - sx, c.endY - sy) <= 0.15 * innerCirleBase) ||
+                                        (c.endPos && c.endPos === s.pos))
+                            )
+                            : null;
                         const forcedHand = sManualHand || (existingChain ? existingChain.hand : null);
                         const candHands = forcedHand ? [forcedHand] : ['L', 'R'];
 
@@ -880,29 +1146,52 @@ export function computeHandAssignments(notes, options = {}) {
 
                         for (const h of candHands) {
                             const isContinuationFromSameStepHead = handAtStartPos === h;
+                            const otherHand = h === 'L' ? 'R' : 'L';
+                            const skipSameStepOtherCross = p.slideEndHands.some((se) => se.hand === otherHand);
                             const u = scoreAndApplyAction(p.state, h, sx, sy, stepTime, {
                                 endTime: slideEnd,
                                 lockUntil: slideEnd,
                                 endX: ex,
                                 endY: ey,
+                                midX,
                                 isSingleHead: false,
                                 allowLock: !isContinuationFromSameStepHead,
                                 isSlide: true,
                                 handAtStartPos,
                                 usedHandsOtherPos,
                                 starHeadHand,
+                                relayHand: relayChain ? relayChain.hand : null,
+                                relayChainEndTime: relayChain ? relayChain.endTime : -10,
+                                skipSameStepOtherCross,
+                            });
+
+                            const addedChains = cl.items.map((br) => {
+                                const bn = br.note;
+                                const bEndPt =
+                                    bn.path && typeof bn.path.getPointAt === 'function'
+                                        ? bn.path.getPointAt(1)
+                                        : getNoteScreenPos(bn.slideEnd || bn.pos);
+                                return {
+                                    index: bn.index,
+                                    baseTime: bn.time,
+                                    endPos: bn.slideEnd,
+                                    endX: bEndPt ? bEndPt.x : ex,
+                                    endY: bEndPt ? bEndPt.y : ey,
+                                    hand: h,
+                                    endTime: bn.time + (bn.slideDelay || 0) + (bn.slideDuration || 0),
+                                };
                             });
 
                             const nextChains = [
-                                ...p.chains.filter((c) => c !== existingChain),
-                                {
-                                    index: s.index,
-                                    baseTime: s.time,
-                                    endPos: s.slideEnd,
-                                    hand: h,
-                                    endTime: slideEnd,
-                                },
+                                ...p.chains.filter((c) => c !== existingChain && c !== relayChain),
+                                ...addedChains,
                             ];
+
+                            const newAssigns = cl.items.map((br) => ({
+                                note: br.note,
+                                hand: h,
+                                isManual: Boolean(br.manualHand),
+                            }));
 
                             nextPool.push({
                                 state: {
@@ -910,8 +1199,11 @@ export function computeHandAssignments(notes, options = {}) {
                                     ...u,
                                 },
                                 chains: nextChains,
-                                assigns: [...p.assigns, { note: s, hand: h, isManual: Boolean(sManualHand) }],
-                                slideEndHands: [...p.slideEndHands, { hand: h, ex }],
+                                assigns: [...p.assigns, ...newAssigns],
+                                slideEndHands: [
+                                    ...p.slideEndHands,
+                                    { hand: h, sx, sy, ex, repX: 0.55 * midX + 0.45 * ex },
+                                ],
                             });
                         }
                     }
@@ -925,10 +1217,13 @@ export function computeHandAssignments(notes, options = {}) {
                             for (let bIdx = aIdx + 1; bIdx < finalBranch.slideEndHands.length; bIdx++) {
                                 const seA = finalBranch.slideEndHands[aIdx];
                                 const seB = finalBranch.slideEndHands[bIdx];
-                                if (seA.hand === 'L' && seB.hand === 'R' && seA.ex > seB.ex + 2) {
-                                    branchCost += 140 + 240 * ((seA.ex - seB.ex) / innerCirleBase);
-                                } else if (seA.hand === 'R' && seB.hand === 'L' && seB.ex > seA.ex + 2) {
-                                    branchCost += 140 + 240 * ((seB.ex - seA.ex) / innerCirleBase);
+                                const sameStart = Math.hypot(seA.sx - seB.sx, seA.sy - seB.sy) <= 0.1 * innerCirleBase;
+                                const xA = sameStart ? seA.repX : seA.ex;
+                                const xB = sameStart ? seB.repX : seB.ex;
+                                if (seA.hand === 'L' && seB.hand === 'R' && xA > xB + 2) {
+                                    branchCost += 140 + 240 * ((xA - xB) / innerCirleBase);
+                                } else if (seA.hand === 'R' && seB.hand === 'L' && xB > xA + 2) {
+                                    branchCost += 140 + 240 * ((xB - xA) / innerCirleBase);
                                 }
                             }
                         }
@@ -1110,14 +1405,26 @@ function buildHandTimelines(notes, assignmentsMap) {
 
     const sortAndClean = (list) => {
         list.sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime);
-        for (let i = 0; i < list.length - 1; i++) {
+        const cleaned = [];
+        for (let i = 0; i < list.length; i++) {
             const cur = list[i];
-            const next = list[i + 1];
-            if ((cur.type === 'tap' || cur.type === 'touch') && cur.endTime > next.startTime) {
+            const next = i + 1 < list.length ? list[i + 1] : null;
+            if (
+                next &&
+                cur.type === 'slide' &&
+                next.type === 'slide' &&
+                Math.abs(cur.startTime - next.startTime) < 0.005 &&
+                cur.endTime <= next.endTime + 1e-6 &&
+                Math.hypot(cur.startX - next.startX, cur.startY - next.startY) <= 0.15 * innerCirleBase
+            ) {
+                continue;
+            }
+            if (next && (cur.type === 'tap' || cur.type === 'touch') && cur.endTime > next.startTime) {
                 cur.endTime = next.startTime;
             }
+            cleaned.push(cur);
         }
-        return list;
+        return cleaned;
     };
 
     return {
