@@ -1,0 +1,25 @@
+{
+  "id": "com.susuy0725.hand-hint-engine",
+  "name": "手順解析引擎",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "description": "自動推算 maimai 譜面左右手順（L / R / BOTH），提供虛擬雙手游標與移動軌跡、主圓盤手順角標及視覺化編輯器手順提示。",
+  "author": "Susuy0725",
+  "entry": "index.js",
+  "runtime": "trusted",
+  "homepage": "https://github.com/Susuy0725/web-mai-chart-x",
+  "permissions": [
+    "chart:read",
+    "view:read",
+    "playback:read",
+    "render:overlay",
+    "settings:read",
+    "commands:register",
+    "events:subscribe",
+    "ui:menu",
+    "ui:popover",
+    "ui:toast",
+    "i18n:register",
+    "storage"
+  ]
+}
